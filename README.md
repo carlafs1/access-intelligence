@@ -61,16 +61,20 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 - Organização inicial do repositório.
 - Documentação do projeto.
 
-### [ ] Fase 1 — Coleta
+### [x] Fase 1 — Coleta
 
 - Extração automatizada dos logs do CloudWatch.
 - Persistência dos eventos brutos na camada Bronze.
+- Armazenamento em Apache Parquet.
+- Particionamento por data.
+- Controle de reprocessamento através de Collection ID.
 - Construção do histórico operacional.
 
 ### [ ] Fase 2 — Normalização
 
+- Parsing dos eventos brutos.
 - Estruturação dos eventos em formato tabular.
-- Conversão para Apache Parquet.
+- Extração de atributos operacionais.
 - Construção da camada Silver.
 
 ### [ ] Fase 3 — Enriquecimento
@@ -113,9 +117,10 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 ## 🛠️ Tecnologias
 
 - Python
-- DuckDB
-- Apache Parquet
 - AWS CloudWatch Logs
+- Apache Parquet
+- Cloudflare R2
+- DuckDB
 - Streamlit
 - Scikit-Learn
 - APIs de LLM
@@ -124,8 +129,14 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 
 ## Status
 
-Projeto em fase inicial de estruturação.
+Projeto em desenvolvimento.
 
-**Fase atual:** Estruturação (Fase 0)
+**Fase atual:** Coleta (Fase 1)
 
-**Próxima etapa:** implementação da camada Bronze e automação da coleta dos logs do CloudWatch.
+**Concluído:**
+- Estruturação da arquitetura Lakehouse
+- Implementação da camada Bronze
+- Coleta automatizada de logs do CloudWatch
+- Persistência em Apache Parquet
+
+**Próxima etapa:** Normalização e construção da camada Silver (Fase 2)
