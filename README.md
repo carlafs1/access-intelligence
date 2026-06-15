@@ -70,42 +70,54 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 - Controle de reprocessamento através de Collection ID.
 - Construção do histórico operacional.
 
-### [ ] Fase 2 — Normalização
+### [x] Fase 2 — Camada Silver
 
+#### [x] 2.1 Normalização
+
+- Reconstrução das execuções da Lambda a partir dos logs.
 - Parsing dos eventos brutos.
+- Extração do JSON dos eventos HTTP.
 - Estruturação dos eventos em formato tabular.
-- Extração de atributos operacionais.
 - Construção da camada Silver.
 
-### [ ] Fase 3 — Enriquecimento
+#### [x] 2.2 Classificação Operacional
+
+- Classificação dos eventos do ciclo de vida do ambiente.
+- Identificação de criação, acesso e destruição do ambiente.
+- Consolidação dos estados operacionais.
+- Extração de indicadores de comportamento operacional.
+
+#### [~] 2.3 Enriquecimento
 
 - Classificação de User Agents.
 - Identificação de acessos humanos, bots e scanners.
 - Enriquecimento geográfico e contextual dos eventos.
-- Consolidação da camada Silver enriquecida.
+- Avaliação e consolidação dos atributos analíticos da camada Silver.
+- Geração de identificadores analíticos de visitantes.
+- Regras de correlação de visitantes em teste e refinamento.
 
-### [ ] Fase 4 — Analytics
+### [ ] Fase 3 — Analytics (Gold)
 
 - Construção da camada Gold.
 - Métricas operacionais.
 - Indicadores comportamentais.
 - Agregações para consumo analítico.
 
-### [ ] Fase 5 — Observabilidade
+### [ ] Fase 4 — Observabilidade
 
 - Dashboards operacionais.
 - Relatórios automatizados.
 - Monitoramento contínuo do ambiente.
 - Alertas operacionais.
 
-### [ ] Fase 6 — Inteligência
+### [ ] Fase 5 — Inteligência
 
 - Detecção de anomalias.
 - Identificação de padrões incomuns.
 - Perfis comportamentais de acesso.
 - Classificação automática de eventos.
 
-### [ ] Fase 7 — IA Generativa
+### [ ] Fase 6 — IA Generativa
 
 - Investigação de eventos em linguagem natural.
 - Resumos automáticos de ocorrências.
@@ -131,12 +143,30 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 
 Projeto em desenvolvimento.
 
-**Fase atual:** Coleta (Fase 1)
+### Fase Atual
 
-**Concluído:**
-- Estruturação da arquitetura Lakehouse
-- Implementação da camada Bronze
-- Coleta automatizada de logs do CloudWatch
-- Persistência em Apache Parquet
+**Camada Silver (normalização, classificação e enriquecimento).**
 
-**Próxima etapa:** Normalização e construção da camada Silver (Fase 2)
+### Concluído
+
+- Estruturação da arquitetura Lakehouse.
+- Implementação da camada Bronze.
+- Coleta automatizada de logs do CloudWatch.
+- Persistência em Apache Parquet.
+- Reconstrução das execuções da Lambda.
+- Extração e normalização dos eventos HTTP.
+- Classificação operacional dos eventos.
+- Implementação inicial do enriquecimento analítico.
+
+### Em Teste / Refinamento
+
+- Estratégias de identificação de visitantes (`visitor_id`).
+- Avaliação da utilidade dos atributos analíticos da Silver.
+- Consolidação do modelo de enriquecimento.
+- Correlação de eventos ao longo do ciclo de vida do ambiente.
+- Indicadores comportamentais avançados.
+- Regras de enriquecimento analítico.
+
+### Próxima Etapa
+
+**Construção da camada Gold com métricas, indicadores e agregações analíticas.**

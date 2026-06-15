@@ -1,0 +1,162 @@
+const fs = require("fs");
+
+fs.mkdirSync("docs", { recursive: true });
+
+const campos = [
+  ["request_id", "string", "Não", "Identificador técnico único da execução da Lambda controle.", "Linha START RequestId do CloudWatch."],
+  ["api_gateway_request_id", "string", "Sim", "Identificador da requisição HTTP recebida pelo API Gateway.", "requestContext.requestId."],
+  ["timestamp_utc", "timestamp", "Sim", "Momento da ocorrência em UTC.", "requestContext.timeEpoch ou timestamp do bloco CloudWatch."],
+  ["ip", "string", "Sim", "IP real do visitante.", "Header cf-connecting-ip."],
+  ["pais_cf", "string", "Sim", "País de origem informado pela Cloudflare.", "Header cf-ipcountry."],
+  ["method", "string", "Sim", "Método HTTP utilizado.", "requestContext.http.method."],
+  ["raw_path", "string", "Sim", "Caminho solicitado.", "Campo rawPath."],
+  ["host", "string", "Sim", "Domínio acessado.", "Header host."],
+  ["user_agent", "string", "Sim", "Identificação do navegador, bot, crawler ou scanner.", "Header user-agent."],
+  ["referer", "string", "Sim", "Origem da navegação quando disponível.", "Header referer ou referrer."],
+  ["accept_language", "string", "Sim", "Idiomas preferenciais do cliente.", "Header accept-language."],
+  ["cf_ray", "string", "Sim", "Identificador da transação no Cloudflare.", "Header cf-ray."],
+  ["x_forwarded_for", "string", "Sim", "Cadeia de IPs atravessados pela requisição.", "Header x-forwarded-for."],
+  ["source_ip_cloudflare", "string", "Sim", "IP visto pelo API Gateway.", "requestContext.http.sourceIp."],
+  ["log_group", "string", "Sim", "Grupo do CloudWatch Logs.", "Metadado da Bronze."],
+  ["log_stream", "string", "Sim", "Stream do CloudWatch Logs.", "Metadado da Bronze."],
+  ["block_closed", "boolean", "Não", "Indica se o bloco START/END foi fechado corretamente.", "Reconstrução dos blocos da Lambda."],
+  ["is_http_event", "boolean", "Não", "Indica se o bloco contém evento HTTP estruturado.", "Presença de headers e requestContext.http."],
+  ["origem_eventbridge", "boolean", "Não", "Indica se a execução foi iniciada pelo EventBridge.", "Log Origem EventBridge: True."],
+  ["ambiente_ativo", "boolean", "Não", "Indica se existia ambiente S3 ativo.", "Log Ambientes ativos encontrados."],
+  ["bucket_name", "string", "Sim", "Nome do bucket S3 ativo ou marcador TEMPORARIO durante criação.", "Log S3 ativo encontrado ou marcador operacional TEMPORARIO."],
+  ["status_confianca", "string", "Não", "Classificação operacional do acesso.", "Mensagens Acesso confiável, Acesso rejeitado ou Origem EventBridge."],
+  ["motivo_confianca", "string", "Sim", "Motivo normalizado da classificação.", "Mensagem de decisão da Lambda controle."],
+  ["disparou_apply", "boolean", "Não", "Indica se o workflow apply.yml foi acionado.", "Logs de disparo do apply.yml."],
+  ["disparou_destroy", "boolean", "Não", "Indica se o workflow destroy.yml foi acionado.", "Logs de disparo do destroy.yml."],
+  ["acordou_ambiente", "boolean", "Não", "Indica se o acesso iniciou o processo de criação do ambiente efêmero.", "Derivado da decisão operacional e do disparo do apply.yml."],
+  ["aguardando_criacao", "boolean", "Não", "Indica se a resposta exibiu a página de espera durante a criação do ambiente.", "Derivado de bucket_name TEMPORARIO e estado operacional da resposta."],
+  ["carregou_site", "boolean", "Não", "Indica se o site foi servido ao visitante.", "Derivado de bucket real ativo e resposta de site servido."],
+  ["estado_resposta", "string", "Não", "Estado operacional consolidado da resposta da Lambda controle.", "Classificação gerada em classify_events.py."],
+  ["manter_para_analise", "boolean", "Não", "Indica se o registro deve ser priorizado na análise da Gold.", "Regra analítica gerada em classify_events.py."],
+  ["motivo_analise", "string", "Sim", "Motivo pelo qual o registro foi marcado ou não para análise.", "Regra analítica gerada em classify_events.py."],
+  ["network_prefix", "string", "Sim", "Prefixo IPv6 /64 do visitante, quando aplicável.", "Derivado do campo ip."],
+  ["browser_family", "string", "Sim", "Família do navegador, bot ou ferramenta.", "Derivado do user_agent. Nulo se user_agent ausente."],
+  ["device_type", "string", "Sim", "Tipo provável de dispositivo.", "Derivado do user_agent. Nulo se user_agent ausente."],
+  ["visitor_type", "string", "Sim", "Tipo analítico do visitante.", "Derivado de user_agent e status_confianca. Nulo se ambos ausentes."],
+  ["cf_pop", "string", "Sim", "Ponto de presença Cloudflare.", "Derivado do sufixo de cf_ray."],
+  ["visitor_id", "string", "Sim", "Assinatura técnica aproximada para recorrência provável.", "Hash de prefixo/IP, navegador, dispositivo, idioma, país e POP. Nulo se campos base ausentes."],
+  ["parse_status", "string", "Não", "Resultado do parser.", "Gerado no processo Bronze → Silver."],
+  ["parse_error", "string", "Sim", "Erro de parsing, se houver.", "Exceção capturada pelo parser."]
+];
+
+let md = `# Dicionário de Dados — Silver / access_events
+
+## Metadados do Dataset
+
+| Item | Valor |
+|---|---|
+| Camada | Silver |
+| Dataset | access_events |
+| Partição | year / month / day |
+| Formato | Parquet |
+| Chave primária | request_id |
+| Corte inicial | timestamp_utc >= 2026-06-10T03:00:00Z |
+| Total de campos | ${campos.length} |
+| Versão | 1.1 |
+| Atualizado em | 2026-06-12 |
+
+## Campos
+
+| Campo | Tipo | Nulo? | Definição | Origem |
+|---|---|---|---|---|
+`;
+
+for (const [campo, tipo, nulo, def, origem] of campos) {
+  md += `| \`${campo}\` | ${tipo} | ${nulo} | ${def} | ${origem} |\n`;
+}
+
+md += `
+## Domínios Controlados
+
+### status_confianca
+
+| Valor | Significado |
+|---|---|
+| \`confiavel\` | Acesso aprovado pelas regras atuais. |
+| \`rejeitado\` | Acesso descartado pelas regras da Lambda controle. |
+| \`desconhecido\` | Não houve decisão explícita de confiança no bloco. |
+| \`nao_aplicavel\` | Execução operacional (ex: EventBridge) sem visitante HTTP. |
+
+### estado_resposta
+
+| Valor | Significado |
+|---|---|
+| \`criou_ambiente\` | Acesso confiável iniciou a criação do ambiente efêmero. |
+| \`aguardando_criacao\` | Visitante recebeu página de espera enquanto o ambiente era criado. |
+| \`site_servido\` | Site foi servido a partir de bucket S3 ativo. |
+| \`eventbridge_timeout\` | Execução operacional de timeout pelo EventBridge. |
+| \`eventbridge_destroy\` | Execução operacional relacionada ao destroy do ambiente. |
+| \`indefinido\` | Estado não determinado pelas regras atuais. |
+
+### parse_status
+
+| Valor | Significado |
+|---|---|
+| \`success\` | Registro processado com sucesso. |
+| \`error\` | Registro não processado por erro de parsing. |
+
+### visitor_type
+
+| Valor | Significado |
+|---|---|
+| \`humano_provavel\` | Acesso com características compatíveis com navegação humana. |
+| \`bot\` | Acesso identificado como bot, crawler ou preview. |
+| \`suspeito\` | Acesso rejeitado ou com sinais de risco. |
+
+### browser_family (exemplos não exaustivos)
+
+| Valor | Significado |
+|---|---|
+| \`Chrome\` | Google Chrome ou derivados. |
+| \`Firefox\` | Mozilla Firefox. |
+| \`Safari\` | Apple Safari. |
+| \`curl\` | Requisição via curl. |
+| \`Python Requests\` | Biblioteca requests do Python. |
+| \`Googlebot\` | Crawler do Google. |
+| \`unknown\` | User-agent ausente ou não reconhecido. |
+
+### device_type
+
+| Valor | Significado |
+|---|---|
+| \`desktop\` | Acesso por computador. |
+| \`mobile\` | Acesso por dispositivo móvel. |
+| \`tablet\` | Acesso por tablet. |
+| \`bot\` | Ferramenta automatizada ou crawler. |
+| \`unknown\` | Não identificado. |
+
+## Observações
+
+- \`request_id\` é a chave primária técnica da Silver.
+- \`api_gateway_request_id\` identifica a requisição HTTP e não substitui \`request_id\`.
+- \`block_text\` é usado internamente no parser, mas removido antes da gravação final.
+- \`route_key\` não está sendo gravado na Silver atual.
+- \`timestamp_bsb\` não está sendo gravado na Silver atual; incluir em \`extract_events.py\` se necessário.
+- \`bucket_name\` contém o bucket real quando o site é servido e \`TEMPORARIO\` durante a criação do ambiente.
+- \`aguardando_criacao\` representa refresh da página de espera.
+- \`manter_para_analise\` não descarta registros; apenas orienta a camada Gold.
+- \`visitor_id\` não identifica pessoa real; é assinatura técnica para análise de recorrência.
+- Campos derivados de \`user_agent\` (\`browser_family\`, \`device_type\`, \`visitor_type\`, \`visitor_id\`) são nulos quando o UA está ausente.
+
+## Funil Operacional para a Gold
+
+\`\`\`text
+is_http_event
+      ↓
+status_confianca = confiavel
+      ↓
+estado_resposta
+      ↓
+manter_para_analise
+      ↓
+disparou_apply / carregou_site / disparou_destroy
+\`\`\`
+`;
+
+fs.writeFileSync("docs/data_dictionary.md", md, "utf8");
+console.log("Gerado: docs/data_dictionary.md");

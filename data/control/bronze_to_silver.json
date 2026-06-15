@@ -1,0 +1,7 @@
+{
+  "bronze_to_silver": {
+    "last_processed_file": "data/bronze/cloudwatch/year=2026/month=06/day=12/collection_id=20260612T204337Z/logs.parquet",
+    "last_silver_file": "data/silver/access_events/year=2026/month=06/day=10/events.parquet",
+    "updated_at_utc": "2026-06-13T15:19:46.293446+00:00"
+  }
+}
