@@ -20,3 +20,5 @@ data/silver/*
 
 data/gold/*
 !data/gold/.gitkeep
+
+data/control/*.json
