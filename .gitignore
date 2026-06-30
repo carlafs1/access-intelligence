@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.pytest_cache/
 
 # Node.js
 node_modules/
@@ -12,6 +13,7 @@ node_modules/
 # Jupyter
 .ipynb_checkpoints/
 
+# Dados
 data/bronze/*
 !data/bronze/.gitkeep
 
@@ -21,4 +23,11 @@ data/silver/*
 data/gold/*
 !data/gold/.gitkeep
 
+data/geoip/*
+!data/geoip/.gitkeep
+
 data/control/*.json
+
+# Scripts locais de diagnóstico
+inspecionar_divergentes.py
+scripts/test_r2_connection.py

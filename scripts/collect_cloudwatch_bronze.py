@@ -7,12 +7,16 @@
 ####----    preservando metadados de coleta para rastreabilidade e reprocessamento.    ----####
 ####----                                                                               ----####
 ####----  Estratégia:                                                                  ----####
-####----    1. Lê o último ponto de controle em data/control/pipeline_state.json       ----####
+####----    1. Lê o último ponto de controle do R2 (control/cloudwatch_to_bronze.json, ----####
+####----       bucket access-intelligence-cache) — espelha para o disco local antes,   ----####
+####----       já que load_state()/save_state() abaixo continuam operando sobre o      ----####
+####----       caminho local (state_file), sem precisar reescrever essa lógica.        ----####
 ####----    2. Se existir execução anterior, coleta a partir do último window_end      ----####
 ####----    3. Se não existir, coleta as últimas 25 horas                              ----####
 ####----    4. Grava os eventos em data/bronze/cloudwatch/..., particionados pela      ----####
-####----       data real de cada evento (não pelo momento da coleta)                   ----####
-####----    5. Atualiza o estado somente após gravação bem-sucedida                    ----####
+####----       data real de cada evento (não pelo momento da coleta) — Bronze ainda    ----####
+####----       em disco local; migração para o R2 é decisão futura separada.           ----####
+####----    5. Atualiza o estado (local + R2) somente após gravação bem-sucedida       ----####
 ####----    6. Suporta janela manual (--window-start/--window-end) para reprocessar    ----####
 ####----       um intervalo específico sem depender do state_file                      ----####
 ####----                                                                               ----####
@@ -23,7 +27,7 @@
 ####----    ingestion_time_ms       — Timestamp de ingestão em ms (precisão original)  ----####
 ####----    ingestion_time          — Timestamp de ingestão em ISO 8601 UTC            ----####
 ####----    log_group               — Log group do CloudWatch                          ----####
-####----    log_stream              — Log stream do CloudWatch                         ----####
+####----    log_stream               — Log stream do CloudWatch                        ----####
 ####----    message                 — Mensagem bruta (JSON ou texto livre da Lambda)   ----####
 ####----    message_size            — Tamanho em bytes de message (detecção anomalia)  ----####
 ####----    source_service          — Origem do log (cloudwatch_logs, waf_logs etc.)   ----####
@@ -42,6 +46,16 @@ import json
 
 import boto3
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from scripts.config import load_r2_config, CONTROL_KEY_CLOUDWATCH_TO_BRONZE
+from scripts.control import (
+    load_control_state_from_r2,
+    save_control_state_to_r2,
+)
+from scripts.silver.enrich_geoip import make_r2_client
 
 
 ####-------------------------------####
@@ -118,7 +132,11 @@ def build_collection_id(dt):
 
 def load_state(state_file):
     """
-    Lê o estado da última execução bem-sucedida.
+    Lê o estado da última execução bem-sucedida a partir do espelho local.
+
+    O espelho é sincronizado a partir do R2 em main() antes desta chamada
+    (ver sync_control_from_r2) — esta função continua operando só sobre o
+    disco local, sem precisar saber nada sobre R2.
 
     Exemplo esperado:
       {
@@ -137,13 +155,35 @@ def load_state(state_file):
 
 
 def save_state(state_file, state):
-    """Grava o estado atualizado do pipeline."""
+    """Grava o estado atualizado do pipeline no espelho local."""
     path = Path(state_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(state, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def sync_control_from_r2(r2_client, control_bucket, state_file):
+    """
+    Lê o controle do R2 (fonte de verdade) e espelha para o disco local,
+    no caminho que load_state()/resolve_collection_window() esperam.
+
+    Sem controle no R2 ainda (primeiro run): não escreve nada local —
+    load_state() trata a ausência do arquivo como "nunca executou", e
+    resolve_collection_window() cai no fallback de 25 horas.
+    """
+    control_state = load_control_state_from_r2(
+        r2_client, bucket=control_bucket, key=CONTROL_KEY_CLOUDWATCH_TO_BRONZE,
+    )
+
+    if control_state:
+        save_state(state_file, control_state)
+        print(f"Controle sincronizado do R2 para o espelho local: {state_file}")
+    else:
+        print("Nenhum controle encontrado no R2. Coletando janela inicial (25h).")
+
+    return control_state
 
 
 def resolve_collection_window(state, now):
@@ -461,7 +501,13 @@ def main():
     # divergências entre collection_window_end e collected_at_utc.
     now = utc_now()
 
-    state = load_state(args.state_file)
+    config = load_r2_config()
+    r2_client = make_r2_client(
+        config.account_id, config.access_key_id, config.secret_access_key,
+    )
+
+    # ── 1. Sincroniza o controle: R2 (fonte de verdade) -> espelho local ────
+    state = sync_control_from_r2(r2_client, config.bucket_cache, args.state_file)
 
     manual_window = bool(args.window_start and args.window_end)
     collection_type = "manual_reprocess" if manual_window else "incremental"
@@ -510,6 +556,8 @@ def main():
     should_update_state = (not manual_window) or args.update_state
 
     if should_update_state:
+        # ── 2. Controle só é atualizado DEPOIS da gravação confirmada ───────
+        # (local + R2, mesma ordem segura do run_silver.py)
         state = update_state_after_success(
             state=state,
             collection_id=collection_id,
@@ -521,9 +569,14 @@ def main():
         )
 
         save_state(args.state_file, state)
+        save_control_state_to_r2(
+            state, r2_client, bucket=config.bucket_cache, key=CONTROL_KEY_CLOUDWATCH_TO_BRONZE,
+        )
+        print(f"Controle atualizado: {args.state_file} "
+              f"(espelhado em r2://{config.bucket_cache}/{CONTROL_KEY_CLOUDWATCH_TO_BRONZE})")
     else:
         print(
-            "Janela manual usada para reprocessamento: state_file NÃO foi "
+            "Janela manual usada para reprocessamento: controle NÃO foi "
             "atualizado (use --update-state para forçar)."
         )
 
@@ -535,8 +588,6 @@ def main():
     print("Arquivos Bronze gerados:")
     for path in output_paths:
         print(f"  - {path}")
-    if should_update_state:
-        print(f"Estado atualizado:  {args.state_file}")
 
 
 if __name__ == "__main__":

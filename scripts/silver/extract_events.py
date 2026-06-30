@@ -12,19 +12,27 @@
 ####----                                                                               ----####
 ####----  Saída em memória:                                                            ----####
 ####----    Lista de registros com campos estruturados de acesso:                      ----####
-####----      - request_id                                                             ----####
-####----      - timestamp_utc / timestamp_bsb                                          ----####
-####----      - ip                                                                     ----####
-####----      - país Cloudflare                                                        ----####
-####----      - user_agent                                                             ----####
-####----      - path, método, host                                                     ----####
-####----      - headers relevantes                                                     ----####
+####----      - request_id, timestamp_utc                                              ----####
+####----      - ip, pais_cf, source_ip_cloudflare                                      ----####
+####----      - user_agent, referer, accept_language                                   ----####
+####----      - accept, accept_encoding, range                                         ----####
+####----      - sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform                        ----####
+####----      - sec_fetch_dest, sec_fetch_mode, sec_fetch_site, sec_fetch_user         ----####
+####----      - raw_path, raw_query_string, method, host                               ----####
+####----      - cf_ray, x_forwarded_for                                                ----####
 ####----      - block_text preservado apenas para classificação posterior              ----####
 ####----                                                                               ----####
 ####----  Observação:                                                                  ----####
 ####----    block_text é campo técnico temporário. Ele precisa existir em memória para ----####
 ####----    classify_events.py detectar EventBridge, bucket, apply, destroy e status   ----####
-####----    de confiança, mas deve ser removido antes da gravação da Silver final.      ----####
+####----    de confiança, mas deve ser removido antes da gravação da Silver final.     ----####
+####----                                                                               ----####
+####----  Campos NÃO extraídos aqui (responsabilidade de outros scripts):              ----####
+####----    - browser_family, device_type, is_scanner_user_agent,                      ----####
+####----      is_social_preview → classify_events.py                                   ----####
+####----    - network_prefix, visitor_id, site_session_id → enrich_visitors.py         ----####
+####----    - geo_* → enrich_geoip.py                                                  ----####
+####----    - suspicion_score, human_probability, visitor_type → classify_events.py    ----####
 ####----                                                                               ----####
 ####---------------------------------------------------------------------------------------####
 
@@ -32,15 +40,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
-
-
-####------------------------####
-####----  Configuração  ----####
-####------------------------####
-
-TZ_BSB = timezone(timedelta(hours=-3))
 
 
 ####-------------------####
@@ -48,7 +49,7 @@ TZ_BSB = timezone(timedelta(hours=-3))
 ####-------------------####
 
 RE_EVENTO_RECEBIDO = re.compile(r"Evento recebido:")
-RE_FIRST_JSON = re.compile(r"\{")
+RE_FIRST_JSON      = re.compile(r"\{")
 
 
 ####-------------------------------####
@@ -104,18 +105,18 @@ def extract_event_json(block_text: str) -> tuple[dict[str, Any] | None, str | No
     if not marker:
         return None, "Evento recebido não encontrado"
 
-    tail = block_text[marker.end():]
+    tail       = block_text[marker.end():]
     first_json = RE_FIRST_JSON.search(tail)
 
     if not first_json:
         return None, "JSON não encontrado após Evento recebido"
 
-    raw = tail[first_json.start():]
+    raw       = tail[first_json.start():]
 
-    depth = 0
-    end_idx = 0
+    depth     = 0
+    end_idx   = 0
     in_string = False
-    escape = False
+    escape    = False
 
     for i, ch in enumerate(raw):
         if escape:
@@ -151,7 +152,7 @@ def extract_event_json(block_text: str) -> tuple[dict[str, Any] | None, str | No
     try:
         return json.loads(json_str), None
     except json.JSONDecodeError as exc:
-        return None, f"json.loads falhou: {exc}"
+        return None, f"json_decode_error: {exc}"
 
 
 ####-----------------------------------------####
@@ -178,13 +179,14 @@ def extract_events(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         event, error = extract_event_json(block_text)
         event = event or {}
 
-        headers = safe_get(event, "headers", default={}) or {}
+        headers         = safe_get(event, "headers",      default={}) or {}
         request_context = safe_get(event, "requestContext", default={}) or {}
-        http = safe_get(request_context, "http", default={}) or {}
+        http            = safe_get(request_context, "http", default={}) or {}
 
+        # Preferência pelo timeEpoch do requestContext (mais preciso que o
+        # timestamp do CloudWatch, que é o momento de ingestão do log).
         timestamp_utc = block.get("start_ts")
-
-        epoch_ms = safe_get(request_context, "timeEpoch")
+        epoch_ms      = safe_get(request_context, "timeEpoch")
 
         if epoch_ms:
             try:
@@ -195,45 +197,74 @@ def extract_events(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             except Exception:
                 pass
 
-        timestamp_bsb = timestamp_utc.astimezone(TZ_BSB) if timestamp_utc else None
+        # Protege datetime ingênuo (tzinfo is None): adiciona UTC explicitamente
+        # para evitar que isoformat() produza strings sem offset, que quebram
+        # comparações temporais na Silver.
+        if isinstance(timestamp_utc, datetime) and timestamp_utc.tzinfo is None:
+            timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
 
         records.append(
             {
-                "request_id": block["request_id"],
-                "api_gateway_request_id": safe_get(
-                    request_context,
-                    "requestId",
-                    default="",
-                ) or "",
+                # ── Requisição HTTP ──────────────────────────────────────────
+                "request_id":      block["request_id"],
+                # Formato Z (ex: 2026-06-18T04:17:49.258Z) em vez de +00:00:
+                # mais compacto, amplamente suportado e consistente com o
+                # formato que a AWS usa nos próprios eventos.
+                "timestamp_utc": (
+                    timestamp_utc.isoformat().replace("+00:00", "Z")
+                    if timestamp_utc else None
+                ),
+                "method":          safe_get(http, "method",  default="") or "",
+                "raw_path":        event.get("rawPath",         ""),
+                "raw_query_string":event.get("rawQueryString",  ""),
+                "host":            headers.get("host",          ""),
 
-                "timestamp_utc": timestamp_utc.isoformat() if timestamp_utc else None,
-
-                "ip": headers.get("cf-connecting-ip", ""),
-                "pais_cf": headers.get("cf-ipcountry", ""),
-                "method": safe_get(http, "method", default="") or "",
-                "route_key": event.get("routeKey", ""),
-                "raw_path": event.get("rawPath", ""),
-                "host": headers.get("host", ""),
-                "user_agent": headers.get("user-agent", ""),
-                "referer": headers.get("referer", headers.get("referrer", "")),
-                "accept_language": headers.get("accept-language", ""),
-                "cf_ray": headers.get("cf-ray", ""),
-                "x_forwarded_for": headers.get("x-forwarded-for", ""),
+                # ── Rede e Geolocalização ────────────────────────────────────
+                "ip":                   headers.get("cf-connecting-ip", ""),
+                "pais_cf":              headers.get("cf-ipcountry",     ""),
+                "cf_ray":               headers.get("cf-ray",           ""),
+                "x_forwarded_for":      headers.get("x-forwarded-for",  ""),
                 "source_ip_cloudflare": safe_get(http, "sourceIp", default="") or "",
 
-                "log_group": block.get("log_group", ""),
-                "log_stream": block.get("log_stream", ""),
-                "block_closed": bool(block.get("closed", False)),
+                # ── Navegador e Comportamento ────────────────────────────────
+                "user_agent":        headers.get("user-agent",        ""),
+                "referer":           headers.get("referer",
+                                     headers.get("referrer",          "")),
+                "accept_language":   headers.get("accept-language",   ""),
+                "accept":            headers.get("accept",            ""),
+                "accept_encoding":   headers.get("accept-encoding",   ""),
+                "range":             headers.get("range",             ""),
+
+                # Sec-CH-UA (Chromium Client Hints — cobertura parcial)
+                "sec_ch_ua":         headers.get("sec-ch-ua",         ""),
+                "sec_ch_ua_mobile":  headers.get("sec-ch-ua-mobile",  ""),
+                "sec_ch_ua_platform":headers.get("sec-ch-ua-platform",""),
+
+                # Sec-Fetch (navegadores modernos)
+                "sec_fetch_dest":    headers.get("sec-fetch-dest",    ""),
+                "sec_fetch_mode":    headers.get("sec-fetch-mode",    ""),
+                "sec_fetch_site":    headers.get("sec-fetch-site",    ""),
+                "sec_fetch_user":    headers.get("sec-fetch-user",    ""),
+
+                # ── Operacional / Controle de qualidade ──────────────────────
+                "log_group":    block.get("log_group",  ""),
+                "log_stream":   block.get("log_stream", ""),
+                # Fallback block_closed → closed: reconstruct_blocks.py pode
+                # nomear a chave de forma diferente dependendo da versão.
+                # Tenta "block_closed" primeiro; cai em "closed" se não achar.
+                "block_closed": bool(
+                    block.get("block_closed", block.get("closed", False))
+                ),
+                "is_http_event": bool(headers) and bool(http),
+
+                # parse_status segue os valores do dicionário: "ok" | "erro"
+                "parse_status": "ok"   if error is None else "erro",
+                "parse_error":  ""     if error is None else error,
 
                 # Campo técnico temporário.
                 # Necessário para classify_events.py detectar decisões operacionais.
                 # Deve ser removido antes da gravação da Silver final.
                 "block_text": block_text,
-
-                "is_http_event": bool(headers) and bool(http),
-
-                "parse_status": "success" if error is None else "error",
-                "parse_error": error or "",
             }
         )
 

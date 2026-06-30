@@ -3,63 +3,93 @@
 ####---------------------------------------------------------------------------------------####
 ####----                                                                               ----####
 ####----  Objetivo:                                                                    ----####
-####----    Analisar o texto completo de cada execução da Lambda controle e transfor-  ----####
-####----    mar mensagens operacionais em colunas booleanas/categóricas.               ----####
+####----    Analisar o block_text de cada execução e extrair os campos operacionais    ----####
+####----    emitidos pela Lambda como JSONs estruturados, transformando-os em colunas  ----####
+####----    booleanas/categóricas da camada Silver.                                    ----####
 ####----                                                                               ----####
-####----  Exemplos de decisões detectadas:                                             ----####
-####----    - Origem EventBridge                                                       ----####
-####----    - Acesso confiável ou rejeitado                                            ----####
-####----    - Workflow apply.yml disparado                                             ----####
-####----    - Workflow destroy.yml disparado                                           ----####
-####----    - Ambiente ativo encontrado                                                ----####
-####----    - Site servido via proxy S3                                                ----####
-####----    - Ambiente temporário em criação                                           ----####
-####----    - Refresh enquanto ambiente está em criação                                ----####
+####----  Estratégia de extração:                                                      ----####
+####----    A Lambda emite eventos operacionais como JSONs em linhas separadas.        ----####
+####----    Cada linha pode conter um objeto com campo "event" identificando o tipo.   ----####
+####----    Este script escaneia cada linha do block_text, tenta parsear JSON e        ----####
+####----    indexa os eventos por tipo para extração posterior.                        ----####
+####----                                                                               ----####
+####----  Eventos operacionais reconhecidos:                                           ----####
+####----    lambda_execution         → origem_eventbridge, temp_item, active_items,    ----####
+####----                               bucket                                          ----####
+####----    access_decision          → trusted, reason, user_agent                     ----####
+####----    deploy_triggered         → disparou_apply                                  ----####
+####----    destroy_triggered        → disparou_destroy, bucket, last_accessed_at,     ----####
+####----                               expiration_time                                 ----####
+####----    active_site_untrusted_access → active_site_untrusted_access                ----####
+####----                                                                               ----####
+####----  Campos produzidos (dicionário de dados — aba Final):                         ----####
+####----    event_type               — Silver (discriminador estrutural)               ----####
+####----    origem_eventbridge       — Silver                                          ----####
+####----    status_confianca         — Silver e Gold  ("trusted" | "untrusted" | "")   ----####
+####----    motivo_confianca         — Silver e Gold                                   ----####
+####----    decision_user_agent      — Silver e Gold                                   ----####
+####----    disparou_apply           — Silver e Gold                                   ----####
+####----    disparou_destroy         — Silver e Gold                                   ----####
+####----    bucket_name              — Silver e Gold                                   ----####
+####----    last_accessed_at         — Silver                                          ----####
+####----    expiration_time          — Silver                                          ----####
+####----    active_site_untrusted_access — Silver e Gold                               ----####
+####----    serviu_site              — Silver                                          ----####
+####----    aguardando_criacao       — Silver                                          ----####
+####----    renovou_timeout          — Silver                                          ----####
+####----    deploy_avoided           — Silver e Gold                                   ----####
+####----    estado_resposta          — Silver                                          ----####
+####----    manter_para_analise      — Silver                                          ----####
+####----    motivo_analise           — Silver                                          ----####
+####----                                                                               ----####
+####----  Campos insumo (usados internamente, não viram colunas):                      ----####
+####----    temp_item, active_items  — derivam estado_resposta e aguardando_criacao    ----####
 ####----                                                                               ----####
 ####---------------------------------------------------------------------------------------####
 
 from __future__ import annotations
 
+import json
 import re
 
 
-####-------------------------------####
-####----  Funções utilitárias  ----####
-####-------------------------------####
+####-------------------------------------------------####
+####----  Extração de eventos operacionais JSON  ----####
+####-------------------------------------------------####
 
-def _safe_text(value) -> str:
-    if value is None:
-        return ""
-    return str(value)
-
-
-def normalize_motivo(texto: str) -> str:
+def extract_operational_events(block_text: str) -> dict[str, dict]:
     """
-    Normaliza mensagens textuais da Lambda para valores técnicos padronizados.
+    Escaneia cada linha do block_text e extrai eventos operacionais JSON.
+
+    A Lambda emite uma linha por evento, podendo ter timestamp e outros
+    prefixos antes do JSON. O parser encontra o primeiro '{' da linha
+    e tenta parsear o JSON a partir daí.
+
+    Retorna dict mapeando event_name → dados do evento.
+    Se o mesmo tipo de evento aparecer mais de uma vez (improvável),
+    o último prevalece.
     """
-    t = _safe_text(texto).lower().strip()
+    events: dict[str, dict] = {}
 
-    if "headers básicos de browser ausentes" in t:
-        return "headers_basicos_browser_ausentes"
+    for line in block_text.splitlines():
+        line = line.strip()
+        brace_idx = line.find("{")
 
-    if "passou todas as verificações" in t:
-        return "passou_todas_verificacoes"
+        if brace_idx == -1:
+            continue
 
-    if "bot permitido" in t:
-        return "bot_permitido"
+        json_str = line[brace_idx:]
 
-    if "acesso não confiável" in t:
-        return "acesso_nao_confiavel"
+        try:
+            obj = json.loads(json_str)
 
-    return (
-        t.replace(":", "")
-         .replace(".", "")
-         .replace("/", "_")
-         .replace("-", "_")
-         .replace(" ", "_")
-         .replace("__", "_")
-         .strip("_")
-    )
+            if isinstance(obj, dict) and "event" in obj:
+                events[obj["event"]] = obj
+
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return events
 
 
 ####-------------------------------------####
@@ -68,238 +98,189 @@ def normalize_motivo(texto: str) -> str:
 
 def classify_events(records: list[dict]) -> list[dict]:
     """
-    Adiciona campos operacionais aos registros extraídos.
+    Adiciona campos operacionais aos registros vindos de extract_events.py.
 
-    Esta etapa interpreta as mensagens geradas pela própria Lambda controle.
+    Lê os JSONs estruturados emitidos pela Lambda dentro do block_text
+    e deriva os campos do dicionário de dados (aba Final).
+
+    Campos insumo (usados internamente, não propagados como colunas):
+      temp_item    — indica registro TEMPORARIO no DynamoDB
+      active_items — quantidade de ambientes ativos no momento da execução
+
+    Esses dois campos, junto com bucket_name, alimentam estado_resposta
+    e aguardando_criacao, mas não aparecem como colunas finais.
     """
     classified = []
 
     for record in records:
         result = dict(record)
-        text = _safe_text(result.get("block_text"))
+        text = str(result.get("block_text") or "")
 
-        origem_eventbridge = bool(
-            re.search(r"Origem EventBridge:\s*True", text, re.I)
+        # ── Extração dos eventos operacionais ────────────────────────────────
+        op = extract_operational_events(text)
+
+        # ── lambda_execution ─────────────────────────────────────────────────
+        lambda_exec  = op.get("lambda_execution", {})
+        origem_eventbridge = bool(lambda_exec.get("origem_eventbridge", False))
+        temp_item    = bool(lambda_exec.get("temp_item", False))   # insumo interno
+        active_items = int(lambda_exec.get("active_items", 0))     # insumo interno
+        bucket_exec  = lambda_exec.get("bucket") or ""
+
+        # ── access_decision ──────────────────────────────────────────────────
+        # status_confianca: "trusted" | "untrusted" | ""
+        # Vazio quando não há decisão de acesso (ex.: execuções EventBridge).
+        access_dec = op.get("access_decision", {})
+
+        if access_dec:
+            status_confianca    = "trusted" if access_dec.get("trusted") else "untrusted"
+            motivo_confianca    = access_dec.get("reason", "")
+            decision_user_agent = access_dec.get("user_agent", "")
+        else:
+            status_confianca    = ""
+            motivo_confianca    = ""
+            decision_user_agent = ""
+
+        # ── deploy_triggered ─────────────────────────────────────────────────
+        disparou_apply = "deploy_triggered" in op
+
+        # ── destroy_triggered ────────────────────────────────────────────────
+        destroy_ev      = op.get("destroy_triggered", {})
+        disparou_destroy = bool(destroy_ev)
+        last_accessed_at = destroy_ev.get("last_accessed_at", "")
+        expiration_time  = destroy_ev.get("expiration_time",  "")
+        bucket_destroy   = destroy_ev.get("bucket") or ""
+
+        # ── bucket_name ──────────────────────────────────────────────────────
+        # Prioridade: bucket do destroy (definitivo) > bucket ativo da execução
+        # Nunca usa "TEMPORARIO" como valor — esse é o nome do registro
+        # no DynamoDB antes do bucket existir, não o nome do bucket real.
+        bucket_name = bucket_destroy or bucket_exec or ""
+
+        # ── active_site_untrusted_access ─────────────────────────────────────
+        active_site_untrusted_access = "active_site_untrusted_access" in op
+
+        # ── event_type ───────────────────────────────────────────────────────
+        # Discriminador estrutural: evento mais específico da execução.
+        # Prioridade: destroy > deploy > acesso rejeitado > decisão de acesso
+        #             > execução sem decisão (EB puro)
+        if disparou_destroy:
+            event_type = "destroy_triggered"
+        elif disparou_apply:
+            event_type = "deploy_triggered"
+        elif active_site_untrusted_access:
+            event_type = "active_site_untrusted_access"
+        elif access_dec:
+            event_type = "access_decision"
+        elif lambda_exec:
+            event_type = "lambda_execution"
+        else:
+            event_type = ""
+
+        # ── serviu_site ──────────────────────────────────────────────────────
+        # Detectado por mensagem de texto — a Lambda não emite JSON específico
+        # para esse evento; usa o log textual diretamente.
+        serviu_site = "servindo site via proxy s3" in text.lower()
+
+        # ── aguardando_criacao ───────────────────────────────────────────────
+        # Acesso HTTP durante criação do ambiente:
+        #   temp_item=True  → TEMPORARIO existe (apply já foi disparado antes)
+        #   is_http_event   → é requisição do usuário, não EventBridge
+        #   not disparou_apply → esse acesso NÃO disparou o apply (só aguarda)
+        is_http_event      = bool(result.get("is_http_event", False))
+        aguardando_criacao = temp_item and is_http_event and not disparou_apply
+
+        # ── renovou_timeout ──────────────────────────────────────────────────
+        # Acesso confiável com site já ativo renova o prazo de expiração.
+        # Derivável de estado_resposta + status_confianca; mantido por
+        # clareza operacional.
+        renovou_timeout = (
+            status_confianca == "trusted"
+            and serviu_site
+            and not disparou_apply
+            and not disparou_destroy
+            and not origem_eventbridge
         )
 
-        ambiente_match = re.search(
-            r"Ambientes ativos encontrados:\s*(\d+)",
-            text,
-            re.I,
+        # ── deploy_avoided ───────────────────────────────────────────────────
+        # Acesso não confiável bloqueado quando não havia ambiente ativo.
+        # Mostra o ROI da camada de segurança: deploy que foi evitado.
+        deploy_avoided = (
+            not origem_eventbridge
+            and status_confianca == "untrusted"
+            and not disparou_apply
+            and active_items == 0
+            and not temp_item
         )
 
-        ####-----------------------------------####
-        ####----  Extração do bucket ativo ----####
-        ####-----------------------------------####
-        ####
-        #### Regras:
-        ####
-        #### 1. Quando o ambiente já existe:
-        ####      S3 ativo encontrado: website-s3-iac-cv-efemero-xxxx
-        ####    ou:
-        ####      Proxy S3. Bucket: website-s3-iac-cv-efemero-xxxx
-        ####
-        ####    Neste caso o bucket real deve ser utilizado.
-        ####
-        #### 2. Quando o ambiente ainda está em criação:
-        ####      "bucket_name": "TEMPORARIO"
-        ####
-        ####    O registro TEMPORARIO do DynamoDB representa um ambiente
-        ####    ainda não provisionado.
-        ####
-        #### Prioridade:
-        ####    bucket real > bucket TEMPORARIO
-        ####
-
-        bucket_match = re.search(
-            r"(?:Bucket ativo|Bucket|S3 ativo encontrado|Proxy S3\. Bucket):\s*(\S+)",
-            text,
-            re.I,
-        )
-
-        bucket_json_match = re.search(
-            r'"bucket_name"\s*:\s*"([^"]+)"',
-            text,
-            re.I,
-        )
-
-        bucket_name = ""
-
-        if bucket_match:
-            bucket_name = bucket_match.group(1).strip()
-
-        elif bucket_json_match:
-            bucket_name = bucket_json_match.group(1).strip()
-
-        rejeitado = re.search(
-            r"Acesso rejeitado:\s*(.+)",
-            text,
-            re.I,
-        )
-
-        confiavel = re.search(
-            r"Acesso confiável:\s*(.+)",
-            text,
-            re.I,
-        )
-
-        status_confianca = "desconhecido"
-        motivo_confianca = ""
-
-        if rejeitado:
-            status_confianca = "rejeitado"
-            motivo_confianca = normalize_motivo(rejeitado.group(1))
-
-        elif confiavel:
-            status_confianca = "confiavel"
-            motivo_confianca = normalize_motivo(confiavel.group(1))
-
-        elif origem_eventbridge:
-            status_confianca = "nao_aplicavel"
-            motivo_confianca = "origem_eventbridge"
-
-        disparou_apply = (
-            "Disparando workflow: apply.yml" in text
-            or "Workflow apply.yml disparado com sucesso" in text
-        )
-
-        disparou_destroy = (
-            "Disparando workflow: destroy.yml" in text
-            or "Workflow destroy.yml disparado com sucesso" in text
-        )
-
-        ####---------------------------------------------####
-        ####----  Indicadores de resposta do ambiente ----####
-        ####---------------------------------------------####
-        ####
-        #### acordou_ambiente:
-        ####   Primeiro acesso válido quando ainda não existe bucket ativo.
-        ####   A Lambda cria o registro TEMPORARIO e dispara o workflow apply.
-        ####
-        #### aguardando_criacao:
-        ####   Rechamada/refresh da página de espera enquanto o apply ainda
-        ####   não terminou e o bucket definitivo ainda não foi registrado.
-        ####
-        #### carregou_site:
-        ####   O bucket efêmero já existe e o HTML foi servido via proxy S3.
-        ####
-
-        acordou_ambiente = (
-            "Nenhum TEMPORARIO encontrado. Criando e disparando apply." in text
-            or "Criando registro TEMPORARIO no DynamoDB." in text
-            or disparou_apply
-        )
-
-        aguardando_criacao = (
-            "Registro TEMPORARIO encontrado: True" in text
-            and "Ambiente já está em processo de criação." in text
-        )
-
-        carregou_site = (
-            "S3 ativo encontrado:" in text
-            or "Servindo site via proxy S3" in text
-            or "Proxy S3. Bucket:" in text
-        )
-
-        if acordou_ambiente or aguardando_criacao:
-            bucket_name = "TEMPORARIO"
-
-        ####--------------------------------------####
-        ####----  Estado final da resposta   ----####
-        ####--------------------------------------####
-        ####
-        #### estado_resposta resume o resultado operacional da execução:
-        ####
-        ####   - criou_ambiente:
-        ####       acesso válido disparou criação do ambiente.
-        ####
-        ####   - aguardando_criacao:
-        ####       refresh da página enquanto o apply ainda está em andamento.
-        ####
-        ####   - site_servido:
-        ####       site foi servido a partir do bucket efêmero.
-        ####
-        ####   - eventbridge_destroy:
-        ####       execução EventBridge disparou destroy.
-        ####
-        ####   - eventbridge_timeout:
-        ####       execução EventBridge avaliou timeout/reagendamento.
-        ####
-        ####   - indefinido:
-        ####       execução não se encaixou nas regras conhecidas.
-        ####
-
+        # ── estado_resposta ──────────────────────────────────────────────────
+        # Resume o resultado operacional da execução:
+        #
+        #   eventbridge_destroy  — EB expirou o timeout e destruiu o ambiente
+        #   eventbridge_timeout  — EB avaliou timeout sem destruir
+        #   criou_ambiente       — primeiro acesso válido disparou o apply
+        #   aguardando_criacao   — refresh enquanto o apply ainda está rodando
+        #   site_servido         — site entregue a partir do bucket efêmero
+        #   indefinido           — execução não se encaixou nas regras acima
         if origem_eventbridge and disparou_destroy:
             estado_resposta = "eventbridge_destroy"
-
         elif origem_eventbridge:
             estado_resposta = "eventbridge_timeout"
-
-        elif acordou_ambiente:
+        elif disparou_apply:
             estado_resposta = "criou_ambiente"
-
         elif aguardando_criacao:
             estado_resposta = "aguardando_criacao"
-
-        elif carregou_site:
+        elif active_site_untrusted_access:
+            # Site ativo servido a acesso não confiável — timeout NÃO renovado.
+            # Distinto de site_servido: active_site_untrusted_access foi criado
+            # para capturar este cenário; colapsá-lo em site_servido ocultaria
+            # a informação no estado_resposta.
+            estado_resposta = "site_servido_nao_confiavel"
+        elif serviu_site:
             estado_resposta = "site_servido"
-
         else:
             estado_resposta = "indefinido"
 
-        ####-----------------------------------------####
-        ####----  Marcação para análise posterior ----####
-        ####-----------------------------------------####
-        ####
-        #### A Silver não descarta registros.
-        ####
-        #### O campo manter_para_analise apenas sinaliza se o evento deve
-        #### entrar nas visões analíticas principais da Gold.
-        ####
-        #### Por enquanto, apenas aguardando_criacao é marcado como False,
-        #### pois representa refresh técnico da página de espera.
-        ####
-
+        # ── manter_para_analise / motivo_analise ─────────────────────────────
+        # A Silver não descarta registros. O campo apenas sinaliza se o evento
+        # deve entrar nas visões analíticas principais da Gold.
+        # Atualmente só refresh de provisionamento é marcado como False.
         manter_para_analise = estado_resposta != "aguardando_criacao"
 
-        if estado_resposta == "aguardando_criacao":
-            motivo_analise = "refresh_aguardando_apply"
+        MOTIVO_MAP = {
+            "aguardando_criacao":              "refresh_aguardando_apply",
+            "criou_ambiente":                  "primeiro_acesso_disparou_apply",
+            "site_servido":                    "acesso_site_servido",
+            "site_servido_nao_confiavel": "bot_ou_preview_em_ambiente_ativo",
+            "eventbridge_destroy":             "destroy_automatico",
+            "eventbridge_timeout":             "validacao_timeout_eventbridge",
+        }
+        motivo_analise = MOTIVO_MAP.get(estado_resposta, "classificacao_indefinida")
 
-        elif estado_resposta == "criou_ambiente":
-            motivo_analise = "primeiro_acesso_disparou_apply"
+        # ── Atualiza o registro ──────────────────────────────────────────────
+        result.update({
+            "event_type":                    event_type,
+            "origem_eventbridge":            origem_eventbridge,
+            "status_confianca":              status_confianca,
+            "motivo_confianca":              motivo_confianca,
+            "decision_user_agent":           decision_user_agent,
+            "disparou_apply":                disparou_apply,
+            "disparou_destroy":              disparou_destroy,
+            "bucket_name":                   bucket_name,
+            "last_accessed_at":              last_accessed_at,
+            "expiration_time":               expiration_time,
+            "active_site_untrusted_access":  active_site_untrusted_access,
+            "serviu_site":                   serviu_site,
+            "aguardando_criacao":            aguardando_criacao,
+            "renovou_timeout":               renovou_timeout,
+            "deploy_avoided":                deploy_avoided,
+            "estado_resposta":               estado_resposta,
+            "manter_para_analise":           manter_para_analise,
+            "motivo_analise":                motivo_analise,
+        })
 
-        elif estado_resposta == "site_servido":
-            motivo_analise = "acesso_site_servido"
-
-        elif estado_resposta == "eventbridge_destroy":
-            motivo_analise = "destroy_automatico"
-
-        elif estado_resposta == "eventbridge_timeout":
-            motivo_analise = "validacao_timeout_eventbridge"
-
-        else:
-            motivo_analise = "classificacao_indefinida"
-
-        result["origem_eventbridge"] = origem_eventbridge
-
-        result["ambiente_ativo"] = bool(
-            ambiente_match and int(ambiente_match.group(1)) > 0
-        )
-
-        result["bucket_name"] = bucket_name
-        result["status_confianca"] = status_confianca
-        result["motivo_confianca"] = motivo_confianca
-
-        result["disparou_apply"] = disparou_apply
-        result["disparou_destroy"] = disparou_destroy
-
-        result["acordou_ambiente"] = acordou_ambiente
-        result["aguardando_criacao"] = aguardando_criacao
-        result["carregou_site"] = carregou_site
-
-        result["estado_resposta"] = estado_resposta
-        result["manter_para_analise"] = manter_para_analise
-        result["motivo_analise"] = motivo_analise
+        # Remove campos do script anterior que não constam no dicionário
+        for campo_obsoleto in ("acordou_ambiente", "ambiente_ativo", "carregou_site"):
+            result.pop(campo_obsoleto, None)
 
         classified.append(result)
 

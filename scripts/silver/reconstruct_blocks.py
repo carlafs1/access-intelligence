@@ -11,6 +11,8 @@
 ####----      histórico Bronze.                                                        ----####
 ####----    - Se existir, processa apenas os arquivos posteriores ao último arquivo    ----####
 ####----      Bronze processado com sucesso.                                           ----####
+####----    - "Nenhum arquivo pendente" não é erro — é o estado normal após uma        ----####
+####----      execução bem-sucedida sem novos dados. Retorna lista vazia.              ----####
 ####----    - Este módulo apenas lê o controle. A atualização do JSON deve ocorrer     ----####
 ####----      somente ao final do run_silver.py, após gravação bem-sucedida da Silver. ----####
 ####----                                                                               ----####
@@ -19,7 +21,21 @@
 ####----                                                                               ----####
 ####----  Saída em memória:                                                            ----####
 ####----    DataFrame Bronze + lista de arquivos Bronze selecionados                   ----####
-####----    Lista de blocos com request_id, log_stream, start_ts, end_ts e block_text  ----####
+####----    Lista de blocos com os campos abaixo (insumos para extract_events.py):     ----####
+####----                                                                               ----####
+####----  Campos produzidos por bloco (dicionário de dados — aba Final):               ----####
+####----    request_id   — extraído da linha START RequestId (Silver e Gold)           ----####
+####----    log_group    — preservado da Bronze (rastreabilidade)                      ----####
+####----    log_stream   — preservado da Bronze (rastreabilidade)                      ----####
+####----    start_ts     — datetime UTC do evento START (base do timestamp_utc)        ----####
+####----    end_ts       — datetime UTC do evento END (None se bloco incompleto)       ----####
+####----    block_closed — True se END foi encontrado (Silver: Reconstrução START/END) ----####
+####----    block_text   — texto completo do bloco; campo técnico temporário,          ----####
+####----                   removido antes da gravação da Silver final                  ----####
+####----                                                                               ----####
+####----  Deduplicação:                                                                ----####
+####----    event_id é usado para deduplicação antes da reconstrução, eliminando       ----####
+####----    duplicatas geradas pelo overlap de segurança da Bronze.                    ----####
 ####----                                                                               ----####
 ####---------------------------------------------------------------------------------------####
 
@@ -37,8 +53,8 @@ import pandas as pd
 ####----  Configuração  ----####
 ####------------------------####
 
-DEFAULT_BRONZE_BASE = "data/bronze/cloudwatch"
-DEFAULT_STATE_FILE = "data/control/bronze_to_silver.json"
+DEFAULT_BRONZE_BASE = "data/bronze"
+DEFAULT_STATE_FILE  = "data/control/bronze_to_silver.json"
 
 
 ####-------------------####
@@ -46,7 +62,7 @@ DEFAULT_STATE_FILE = "data/control/bronze_to_silver.json"
 ####-------------------####
 
 RE_START = re.compile(r"START RequestId:\s*(?P<request_id>\S+)")
-RE_END = re.compile(r"END RequestId:\s*(?P<request_id>\S+)")
+RE_END   = re.compile(r"END RequestId:\s*(?P<request_id>\S+)")
 
 
 ####--------------------------------------------####
@@ -55,7 +71,7 @@ RE_END = re.compile(r"END RequestId:\s*(?P<request_id>\S+)")
 
 def select_bronze_files(
     bronze_base: str = DEFAULT_BRONZE_BASE,
-    state_file: str = DEFAULT_STATE_FILE,
+    state_file: str  = DEFAULT_STATE_FILE,
 ) -> list[Path]:
     """
     Seleciona os arquivos Bronze que ainda precisam ser processados pela Silver.
@@ -65,22 +81,25 @@ def select_bronze_files(
       - Com controle: processa somente arquivos com caminho maior que o último
         arquivo processado com sucesso.
 
+    Retorna lista vazia quando não há arquivos pendentes — comportamento normal
+    após execução bem-sucedida sem novos dados. Não levanta exceção nesse caso,
+    pois o orquestrador (run_silver.py) decide o que fazer com lista vazia.
+
     Observação:
-      A ordenação funciona porque a Bronze está particionada por:
+      A ordenação por caminho funciona porque a Bronze está particionada por:
         year=YYYY/month=MM/day=DD/collection_id=YYYYMMDDTHHMMSSZ/logs.parquet
     """
-    files = sorted(Path(bronze_base).rglob("*.parquet"))
+    all_files = sorted(Path(bronze_base).rglob("*.parquet"))
 
-    if not files:
-        raise FileNotFoundError(
-            f"Nenhum arquivo Parquet encontrado em {bronze_base}"
-        )
+    if not all_files:
+        print(f"Nenhum arquivo Parquet encontrado em: {bronze_base}")
+        return []
 
     state_path = Path(state_file)
 
     if not state_path.exists():
         print("Controle Silver não encontrado. Processando todo o histórico Bronze.")
-        return files
+        return all_files
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
 
@@ -91,22 +110,20 @@ def select_bronze_files(
     )
 
     if not last_processed_file:
-        print("Controle Silver existe, mas não possui last_processed_file. Processando tudo.")
-        return files
+        print(
+            "Controle Silver existe, mas não possui last_processed_file. "
+            "Processando todo o histórico Bronze."
+        )
+        return all_files
 
     last_path = Path(last_processed_file)
 
-    files_to_process = [
-        path for path in files
-        if str(path) > str(last_path)
-    ]
+    pending = [f for f in all_files if str(f) > str(last_path)]
 
-    if not files_to_process:
-        raise FileNotFoundError(
-            "Nenhum arquivo Bronze pendente para processar na Silver."
-        )
+    if not pending:
+        print("Nenhum arquivo Bronze pendente. Silver já está atualizada.")
 
-    return files_to_process
+    return pending
 
 
 ####-------------------------------------####
@@ -115,40 +132,40 @@ def select_bronze_files(
 
 def load_bronze(
     bronze_base: str = DEFAULT_BRONZE_BASE,
-    state_file: str = DEFAULT_STATE_FILE,
+    state_file: str  = DEFAULT_STATE_FILE,
 ) -> tuple[pd.DataFrame, list[Path]]:
     """
     Lê os arquivos Parquet da Bronze selecionados para a execução atual.
 
-    Retorna:
-      - DataFrame Pandas com os eventos Bronze selecionados.
-      - Lista de arquivos Bronze lidos, para o orquestrador registrar no controle
-        somente após a Silver finalizar com sucesso.
-    """
-    files = select_bronze_files(
-        bronze_base=bronze_base,
-        state_file=state_file,
-    )
+    Etapas:
+      1. Seleciona arquivos pendentes (ou vazio se já atualizado).
+      2. Lê e concatena os Parquets selecionados.
+      3. Valida colunas obrigatórias.
+      4. Converte timestamp_utc para datetime UTC.
+      5. Ordena por log_stream → timestamp_utc → event_id (ordem de chegada).
+      6. Deduplica por event_id (keep="last" — garante dado mais recente
+         em caso de reprocessamento com overlap de janela).
 
-    print("Arquivos Bronze selecionados para a Silver:", files)
+    Retorna:
+      - DataFrame com eventos Bronze prontos para reconstrução.
+      - Lista de arquivos lidos (para o orquestrador registrar no controle
+        somente após a Silver finalizar com sucesso).
+    """
+    files = select_bronze_files(bronze_base=bronze_base, state_file=state_file)
+
+    if not files:
+        return pd.DataFrame(), []
 
     for path in files:
-        print(f" - {path}")
-
-    dataframes = [pd.read_parquet(path) for path in files]
+        print(f"  Lendo: {path}")
 
     df = pd.concat(
-        dataframes,
+        [pd.read_parquet(path) for path in files],
         ignore_index=True,
     )
 
-    required_columns = {
-        "event_id",
-        "timestamp_utc",
-        "log_stream",
-        "message",
-    }
-
+    # Valida colunas obrigatórias — event_id é essencial para deduplicação
+    required_columns = {"event_id", "timestamp_utc", "log_stream", "message"}
     missing = required_columns - set(df.columns)
 
     if missing:
@@ -162,17 +179,17 @@ def load_bronze(
         errors="coerce",
     )
 
+    # Ordena antes de deduplicar para garantir que "last" seja o evento
+    # cronologicamente mais recente (relevante no overlap de segurança da Bronze).
     df = df.sort_values(
         ["log_stream", "timestamp_utc", "event_id"],
         kind="stable",
-    )
-
-    df = df.drop_duplicates(
+    ).drop_duplicates(
         subset=["event_id"],
         keep="last",
     )
 
-    print(f"Eventos Bronze carregados: {len(df)}")
+    print(f"Eventos Bronze carregados após deduplicação: {len(df)}")
 
     return df, files
 
@@ -189,14 +206,26 @@ def reconstruct_blocks(df: pd.DataFrame) -> list[dict[str, Any]]:
     A Silver precisa reagrupar essas linhas em uma execução lógica,
     delimitada por:
 
-      START RequestId: ...
-      ...
-      END RequestId: ...
+      START RequestId: <request_id>
+      ...linhas intermediárias...
+      END RequestId: <request_id>
 
-    Cada bloco reconstruído será usado nas próximas etapas da Silver para:
-      - extrair o JSON recebido;
-      - classificar decisões operacionais;
-      - enriquecer visitantes.
+    Comportamento para blocos incompletos:
+      - Novo START antes de END do anterior: fecha o bloco anterior com
+        block_closed = False e inicia o novo. Ocorre quando a Lambda
+        é encerrada abruptamente (timeout, OOM) ou quando o log foi
+        coletado antes do END ser emitido.
+      - Fim do log_stream sem END: o bloco em aberto é fechado com
+        block_closed = False.
+
+    Separador "\n" entre linhas:
+      As mensagens do CloudWatch podem ou não terminar com "\n". Usar
+      "\n".join() garante que linhas consecutivas nunca fiquem coladas,
+      o que quebraria os regexes do extract_events.py.
+
+    Cada bloco produzido alimenta diretamente extract_events.py.
+    O campo block_text é técnico e temporário — deve ser removido
+    antes da gravação final da Silver.
     """
     blocks: list[dict[str, Any]] = []
 
@@ -204,49 +233,55 @@ def reconstruct_blocks(df: pd.DataFrame) -> list[dict[str, Any]]:
         current: dict[str, Any] | None = None
 
         for _, row in group.iterrows():
-            message = str(row.get("message") or "")
+            message   = str(row.get("message") or "")
             timestamp = row.get("timestamp_utc")
-            log_group = row.get("log_group", "")
+            log_group = str(row.get("log_group", "") or "")
 
-            start = RE_START.search(message)
+            start_match = RE_START.search(message)
 
-            if start:
+            if start_match:
+                # Fecha bloco anterior sem END (bloco incompleto)
                 if current is not None:
-                    current["block_text"] = "".join(current["lines"])
-                    current["closed"] = False
+                    current["block_text"] = "\n".join(current["_lines"])
+                    current["block_closed"] = False
+                    del current["_lines"]
                     blocks.append(current)
 
                 current = {
-                    "request_id": start.group("request_id"),
-                    "log_group": log_group,
-                    "log_stream": log_stream,
-                    "start_ts": timestamp,
-                    "end_ts": None,
-                    "lines": [message],
-                    "closed": False,
+                    "request_id":   start_match.group("request_id"),
+                    "log_group":    log_group,
+                    "log_stream":   log_stream,
+                    "start_ts":     timestamp,
+                    "end_ts":       None,
+                    "block_closed": False,
+                    "_lines":       [message],
                 }
-
                 continue
 
-            end = RE_END.search(message)
+            end_match = RE_END.search(message)
 
-            if end and current is not None:
-                current["lines"].append(message)
-                current["end_ts"] = timestamp
-                current["block_text"] = "".join(current["lines"])
-                current["closed"] = True
-
+            if (
+                end_match
+                and current is not None
+                and end_match.group("request_id") == current["request_id"]
+            ):
+                current["_lines"].append(message)
+                current["end_ts"]       = timestamp
+                current["block_text"]   = "\n".join(current["_lines"])
+                current["block_closed"] = True
+                del current["_lines"]
                 blocks.append(current)
                 current = None
-
                 continue
 
             if current is not None:
-                current["lines"].append(message)
+                current["_lines"].append(message)
 
+        # Fim do log_stream: fecha bloco em aberto como incompleto
         if current is not None:
-            current["block_text"] = "".join(current["lines"])
-            current["closed"] = False
+            current["block_text"]   = "\n".join(current["_lines"])
+            current["block_closed"] = False
+            del current["_lines"]
             blocks.append(current)
 
     return blocks

@@ -52,6 +52,46 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 
 ---
 
+## Estrutura do Projeto
+
+```text
+access-intelligence/
+├── scripts/
+│   ├── collect_cloudwatch_bronze.py   # Fase 1 — coleta CloudWatch → Bronze
+│   ├── control.py                     # Estado de coleta (R2: cloudwatch_to_bronze.json)
+│   ├── config.py                      # Configuração do projeto (R2, janelas, etc.)
+│   ├── test_r2_connection.py
+│   └── silver/
+│       ├── reconstruct_blocks.py      # Reconstrução das execuções da Lambda
+│       ├── extract_events.py          # Parsing dos eventos HTTP
+│       ├── classify_events.py         # Classificação operacional do ciclo de vida
+│       ├── enrich_visitors.py         # Fingerprint e classificação de visitantes
+│       ├── enrich_geoip.py            # Enriquecimento geográfico + cross-validação
+│       └── run_silver.py              # Orquestrador da camada Silver
+├── tests/
+│   ├── test_cloudwatch_to_bronze.py
+│   └── silver/                        # Um teste por módulo da Silver
+├── tools/
+│   └── gerar_data_dictionary_md.js    # Gera docs/data_dictionary.md
+├── docs/
+│   └── data_dictionary.md             # Dicionário de dados e linhagem (Bronze → Silver → Gold)
+└── inspecionar_divergentes.py
+```
+
+---
+
+## Dicionário de Dados
+
+A linhagem completa dos campos — onde cada um nasce (Bronze), como é transformado (Silver) e o que é planejado para análise (Gold) — está documentada em [`docs/data_dictionary.md`](docs/data_dictionary.md).
+
+O dicionário é gerado a partir da validação do código real (não só do design), cruzando os scripts de `scripts/` e `scripts/silver/` com a planilha de design do projeto. Para regenerar após qualquer mudança nos campos:
+
+```bash
+node tools/gerar_data_dictionary_md.js
+```
+
+---
+
 ## 🚀 Roadmap
 
 ### [x] Fase 0 — Estruturação
@@ -91,7 +131,9 @@ Os eventos registrados incluem informações de acesso, origem, comportamento do
 
 - Classificação de User Agents.
 - Identificação de acessos humanos, bots e scanners.
-- Enriquecimento geográfico e contextual dos eventos.
+- Enriquecimento geográfico via MaxMind GeoLite2 (país, cidade, ASN, provedor de rede).
+- Cross-validação geográfica com IPinfo como segunda fonte (distância Haversine entre as duas estimativas, classificação de severidade de divergência).
+- Detecção de provedor de nuvem/datacenter e redes de scanner conhecidas.
 - Avaliação e consolidação dos atributos analíticos da camada Silver.
 - Geração de identificadores analíticos de visitantes.
 - Regras de correlação de visitantes em teste e refinamento.
